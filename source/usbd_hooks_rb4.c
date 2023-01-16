@@ -222,6 +222,7 @@ int TsceUsbdGetDeviceDescriptor_hook(libusb_device *device, struct libusb_device
                     // guitar
                     desc->idProduct = 0x0200;
                     break;
+                case 0x0005:
                 case 0x3110:
                 case 0x3138:
                     // drums

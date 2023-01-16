@@ -42,6 +42,15 @@ static const int num_PadHookTitleIDs = sizeof(PadHookTitleIDs) / sizeof(PadHookT
 static const char *UsbdHookTitleIDs[] = { "CUSA02901", "CUSA02084" };
 static const int num_UsbdHookTitleIDs = sizeof(UsbdHookTitleIDs) / sizeof(UsbdHookTitleIDs[0]);
 
+void DoNotification(const char* text) {
+    OrbisNotificationRequest Buffer = { 0 };
+    Buffer.useIconImageUri = 1;
+    Buffer.targetId = -1;
+    strcpy(Buffer.message, text);
+    strcpy(Buffer.iconUri, "cxml://psnotification/tex_icon_system");
+    sceKernelSendNotificationRequest(0, &Buffer, sizeof(Buffer), 0);
+}
+
 int32_t attr_module_hidden module_start(size_t argc, const void *args)
 {
     if (sys_sdk_proc_info(&procInfo) != 0) {
@@ -54,6 +63,7 @@ int32_t attr_module_hidden module_start(size_t argc, const void *args)
     for (int i = 0; i < num_PadHookTitleIDs; i++) {
         if (strcmp(procInfo.titleid, PadHookTitleIDs[i]) == 0) {
             final_printf("Applying scePad hooks...\n");
+            DoNotification("OrbisInstrumentalizer active!");
             InitPadHooks();
             UsingPadHooks = true;
         }
@@ -62,6 +72,7 @@ int32_t attr_module_hidden module_start(size_t argc, const void *args)
     for (int i = 0; i < num_UsbdHookTitleIDs; i++) {
         if (strcmp(procInfo.titleid, UsbdHookTitleIDs[i]) == 0) {
             final_printf("Applying sceUsbd hooks...\n");
+            DoNotification("OrbisInstrumentalizer active!");
             InitUsbdHooks();
             UsingUsbdHooks = true;
         }
