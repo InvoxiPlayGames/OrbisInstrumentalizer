@@ -133,10 +133,13 @@ void ParseXInputCallback(struct libusb_transfer *transfer) {
         if ((xparsed->buttons2 & XINPUT_BUTTON_B) != 0) parsed_report.buttons |= BIT(2); // red
         if ((xparsed->buttons2 & XINPUT_BUTTON_Y) != 0) parsed_report.buttons |= BIT(3); // yellow
         if ((xparsed->buttons2 & XINPUT_BUTTON_X) != 0) parsed_report.buttons |= BIT(0); // blue
-        if ((xparsed->buttons2 & XINPUT_BUTTON_LB) != 0) parsed_report.buttons |= BIT(4); // orange
+        if ((xparsed->buttons2 & XINPUT_BUTTON_LB) != 0) parsed_report.buttons |= BIT(4); // orange / (drums) kick
+        if ((xparsed->buttons2 & XINPUT_BUTTON_RB) != 0) parsed_report.buttons |= BIT(11); // (drums) cymbal
         // special buttons
-        if ((xparsed->buttons1 & XINPUT_BUTTON_START) != 0) parsed_report.buttons |= BIT(9); // start
+        if ((xparsed->buttons1 & XINPUT_BUTTON_L3) != 0) parsed_report.buttons |= BIT(5); // (drums) kick 2
         if ((xparsed->buttons1 & XINPUT_BUTTON_BACK) != 0) parsed_report.buttons |= BIT(8); // back
+        if ((xparsed->buttons1 & XINPUT_BUTTON_START) != 0) parsed_report.buttons |= BIT(9); // start
+        if ((xparsed->buttons1 & XINPUT_BUTTON_R3) != 0) parsed_report.buttons |= BIT(10); // (drums) pad
         // dpad/strum bar
         parsed_report.hat = 0x08;
         if ((xparsed->buttons1 & XINPUT_BUTTON_UP) != 0) parsed_report.hat = 0x00;
@@ -237,11 +240,11 @@ int TsceUsbdGetDeviceDescriptor_hook(libusb_device *device, struct libusb_device
             // get the type of controller
             switch (IdentifyDevice(device)) {
                 case RB4_Type_XInputGuitar:
-                case RB4_Type_XInputWireless:
                     desc->idVendor = 0x12BA;
                     desc->idProduct = 0x0200;
                     break;
                 case RB4_Type_XInputDrums:
+                case RB4_Type_XInputWireless:
                     desc->idVendor = 0x12BA;
                     desc->idProduct = 0x0210;
                     break;
