@@ -58,7 +58,6 @@ In no particular order,
 * [RB4] Fix sceUsbd itself not being able to be hooked.
 * [RB4] (Maybe) Support multiple instruments with 360 wireless adapter.
 * [ALL] (LOL NO) Support iOS/Wiimote guitars, either via OS or USB bluetooth dongle.
-* If a new (compatible) plastic instrument game is ever made, support that as well.
 
 ## Building
 
