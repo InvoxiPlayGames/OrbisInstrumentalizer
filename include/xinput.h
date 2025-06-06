@@ -31,6 +31,22 @@
 #define XINPUT_SUBTYPE_GUITAR_BASS      0x0B
 #define XINPUT_SUBTYPE_ARCADE_PAD       0x13
 
+// XBOX 360 controller LED animations
+#define X360_LED_ALL_OFF    0x00
+#define X360_LED_ALL_BLINK  0x01
+#define X360_LED_P1_FLASH   0x02  // Blink player indicator, then solid on
+#define X360_LED_P2_FLASH   0x03
+#define X360_LED_P3_FLASH   0x04
+#define X360_LED_P4_FLASH   0x05
+#define X360_LED_P1         0x06
+#define X360_LED_P2         0x07
+#define X360_LED_P3         0x08
+#define X360_LED_P4         0x09
+#define X360_LED_ROTATE     0x0A
+#define X360_LED_BLINK      0x0B
+#define X360_LED_SLOW_BLINK 0x0C
+#define X360_LED_ALTERNATE  0x0D
+
 // reports from the controller all start with this header
 typedef struct _xinput_report {
     uint8_t message_type;

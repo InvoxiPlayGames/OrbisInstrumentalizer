@@ -34,6 +34,8 @@ void InitUsbdHooks();
 void DestroyUsbdHooks();
 static bool UsingUsbdHooks = false;
 
+void set_xbox_360_player_led();
+
 // Guitar Hero Live
 static const char *PadHookTitleIDs[] = { "CUSA02410", "CUSA02188" };
 static const int num_PadHookTitleIDs = sizeof(PadHookTitleIDs) / sizeof(PadHookTitleIDs[0]);

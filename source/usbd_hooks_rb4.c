@@ -34,8 +34,10 @@ typedef struct _OIRB4OpenDevice {
     uint8_t last_report[30];
 } OIRB4OpenDevice;
 
+#define BIT(i) (1 << i)
 #define MAX_DEVICE_COUNT 4
 static OIRB4OpenDevice open_devices[MAX_DEVICE_COUNT] = { 0 };
+static libusb_device_handle *x360_leds[MAX_DEVICE_COUNT] = { NULL };
 
 int(*TsceUsbdOpen)(int);
 int(*TsceUsbdClose)(int);
@@ -104,7 +106,6 @@ static OIRB4DeviceType IdentifyDevice(libusb_device *device) {
     return type;
 }
 
-#define BIT(i) (1 << i)
 // TODO: this seems bad i dont even know if it do drum
 typedef struct _ps3_rb_guitar_report {
     uint16_t buttons;
@@ -121,41 +122,59 @@ typedef struct _ps3_rb_guitar_report {
     uint8_t unk_2;
     uint16_t gyro;
 } ps3_rb_guitar_report;
+
 libusb_transfer_cb_fn interrupt_callback;
+
 void ParseXInputCallback(struct libusb_transfer *transfer) {
     //final_printf("ParseXInputCallback\n");
     if (transfer->status == LIBUSB_TRANSFER_COMPLETED) {
         ps3_rb_guitar_report parsed_report = { 0 };
         xinput_report_controls *xparsed = (xinput_report_controls *)transfer->buffer;
-        
-        // fret buttons (todo: make sure this is right for drums)
-        if ((xparsed->buttons2 & XINPUT_BUTTON_A) != 0) parsed_report.buttons |= BIT(1); // green
-        if ((xparsed->buttons2 & XINPUT_BUTTON_B) != 0) parsed_report.buttons |= BIT(2); // red
-        if ((xparsed->buttons2 & XINPUT_BUTTON_Y) != 0) parsed_report.buttons |= BIT(3); // yellow
-        if ((xparsed->buttons2 & XINPUT_BUTTON_X) != 0) parsed_report.buttons |= BIT(0); // blue
-        if ((xparsed->buttons2 & XINPUT_BUTTON_LB) != 0) parsed_report.buttons |= BIT(4); // orange / (drums) kick
-        if ((xparsed->buttons2 & XINPUT_BUTTON_RB) != 0) parsed_report.buttons |= BIT(11); // (drums) cymbal
-        // special buttons
-        if ((xparsed->buttons1 & XINPUT_BUTTON_L3) != 0) parsed_report.buttons |= BIT(5); // (drums) kick 2
-        if ((xparsed->buttons1 & XINPUT_BUTTON_BACK) != 0) parsed_report.buttons |= BIT(8); // back
-        if ((xparsed->buttons1 & XINPUT_BUTTON_START) != 0) parsed_report.buttons |= BIT(9); // start
-        if ((xparsed->buttons1 & XINPUT_BUTTON_R3) != 0) parsed_report.buttons |= BIT(10); // (drums) pad
-        // dpad/strum bar
-        parsed_report.hat = 0x08;
+
+        // Lookup device type so we know how to handle inputs
+        OIRB4DeviceType instrument_type = RB4_Type_None;
+        libusb_device_handle *dev_handle = transfer->dev_handle;
+        for (int i = 0; i < MAX_DEVICE_COUNT; i++) {
+            if (open_devices[i].is_open && open_devices[i].device_handle == dev_handle) {
+                instrument_type = open_devices[i].type;
+                break;
+            }
+        }
+
+        // Common buttons/frets/pads
+        if ((xparsed->buttons2 & XINPUT_BUTTON_A) != 0) parsed_report.buttons |= BIT(1);     // Green
+        if ((xparsed->buttons2 & XINPUT_BUTTON_B) != 0) parsed_report.buttons |= BIT(2);     // Red
+        if ((xparsed->buttons2 & XINPUT_BUTTON_Y) != 0) parsed_report.buttons |= BIT(3);     // Yellow
+        if ((xparsed->buttons2 & XINPUT_BUTTON_X) != 0) parsed_report.buttons |= BIT(0);     // Blue
+        if ((xparsed->buttons1 & XINPUT_BUTTON_BACK) != 0) parsed_report.buttons |= BIT(8);  // Back
+        if ((xparsed->buttons1 & XINPUT_BUTTON_START) != 0) parsed_report.buttons |= BIT(9); // Start
+
+        // Common dpad/strum
+        parsed_report.hat = 0x08;  // Center
         if ((xparsed->buttons1 & XINPUT_BUTTON_UP) != 0) parsed_report.hat = 0x00;
         if ((xparsed->buttons1 & XINPUT_BUTTON_DOWN) != 0) parsed_report.hat = 0x04;
         if ((xparsed->buttons1 & XINPUT_BUTTON_LEFT) != 0) parsed_report.hat = 0x06;
         if ((xparsed->buttons1 & XINPUT_BUTTON_RIGHT) != 0) parsed_report.hat = 0x02;
-        // whammy
-        parsed_report.whammy = (uint8_t)((uint16_t)xparsed->right_stick_x / 0x100);
-        // tilt
-        parsed_report.accel_x = (uint8_t)((uint16_t)xparsed->right_stick_y / 0x100);
+
+        if (instrument_type == RB4_Type_XInputGuitar) {
+            if ((xparsed->buttons2 & XINPUT_BUTTON_LB) != 0) {parsed_report.buttons |= BIT(4);}   // Orange
+            if ((xparsed->buttons1 & XINPUT_BUTTON_L3) != 0) {parsed_report.buttons |= BIT(6);}   // Lower frets/solo modifer
+            if (xparsed->right_stick_y >= 0x4000) {parsed_report.buttons |= BIT(5);}              // Tilt (guitar sends value between 0 and 0x7FFF, boil down to a button press)
+            parsed_report.whammy = (uint8_t)((uint16_t)xparsed->right_stick_x / 0x100);           // Whammy (analog)
+
+        } else if (instrument_type == RB4_Type_XInputDrums) {
+            if ((xparsed->buttons2 & XINPUT_BUTTON_LB) != 0) {parsed_report.buttons |= BIT(4);}   // Kick pedal 1
+            if ((xparsed->buttons1 & XINPUT_BUTTON_L3) != 0) {parsed_report.buttons |= BIT(5);}   // Kick pedal 2
+            if ((xparsed->buttons1 & XINPUT_BUTTON_R3) != 0) {parsed_report.buttons |= BIT(10);}  // Pad modifier
+            if ((xparsed->buttons2 & XINPUT_BUTTON_RB) != 0) {parsed_report.buttons |= BIT(11);}  // Cymbal modifier
+        }
 
         // copy the new parsed report back into the buffer
         memcpy(transfer->buffer, &parsed_report, transfer->length);
     }
     interrupt_callback(transfer);
 }
+
 void ParseWirelessXInputCallback(struct libusb_transfer *transfer) {
     // sometimes the wireless report will just be a silly nothingpacket
     // so we have to log the last actual packet somewhere
@@ -171,6 +190,41 @@ void ParseWirelessXInputCallback(struct libusb_transfer *transfer) {
     ParseXInputCallback(transfer);
 }
 
+void set_xbox_360_player_led(libusb_device_handle *handle, int playerIndex) {
+    // Determine LED pattern
+    uint8_t ledPattern = X360_LED_ALL_OFF;
+    switch (playerIndex) {
+        case 1: ledPattern = X360_LED_P1; break;
+        case 2: ledPattern = X360_LED_P2; break;
+        case 3: ledPattern = X360_LED_P3; break;
+        case 4: ledPattern = X360_LED_P4; break;
+        default: ledPattern = X360_LED_ALL_OFF; break;
+    }
+
+    uint8_t buf[] = {
+        0x01,        // Report ID for LEDs
+        0x03,        // Command: Set LED
+        ledPattern   // LED pattern for player index
+    };
+
+    int res = sceUsbdControlTransfer(
+        handle,
+        0x21,                            // bmRequestType: Class | Interface | Host to Device
+        0x09,                            // bRequest: SET_REPORT
+        (2 << 8) | buf[0],               // wValue: (Output report << 8) | Report ID
+        0,                               // wIndex: Interface number (0 assumed)
+        buf,
+        sizeof(buf),
+        10                               // Timeout in ms
+    );
+
+    if (res < 0) {
+        final_printf("LED control failed: %d\n", res);
+    } else {
+        final_printf("Set LED to player %d (pattern 0x%02X)\n", playerIndex, ledPattern);
+    }
+}
+
 int TsceUsbdOpen_hook(libusb_device *device, libusb_device_handle **dev_handle) {
     //final_printf("sceUsbdOpen_hook\n");
     int r = sceUsbdOpen(device, dev_handle);
@@ -182,6 +236,27 @@ int TsceUsbdOpen_hook(libusb_device *device, libusb_device_handle **dev_handle) 
                 return r;
             opendevice->type = type;
             opendevice->device_handle = *dev_handle;
+
+            // Set XBOX 360 player LEDs
+            if (type == RB4_Type_XInputGuitar || type == RB4_Type_XInputDrums) {
+                // Find lowest available player slot
+                int player_slot = -1;
+                for (int i = 0; i < MAX_DEVICE_COUNT; i++) {
+                    if (x360_leds[i] == NULL) {
+                        x360_leds[i] = *dev_handle;
+                        player_slot = i+1;
+                        break;
+                    }
+                }
+
+                if (player_slot > 0) {
+                    set_xbox_360_player_led(*dev_handle, player_slot);
+                    final_printf("Assigned player slot %d\n", player_slot);
+                } else {
+                    final_printf("No free player slots available\n");
+                }
+                
+            }
         }
     }
     return r;
@@ -191,6 +266,16 @@ void TsceUsbdClose_hook(libusb_device_handle *dev_handle) {
     //final_printf("sceUsbdClose_hook\n");
     if (dev_handle == NULL)
         return;
+
+    // Release player slot
+    for (int i = 0; i < MAX_DEVICE_COUNT; i++) {
+        if (x360_leds[i] == dev_handle) {
+            x360_leds[i] = NULL;
+            final_printf("Released player slot %d\n", i + 1);
+            break;
+        }
+    }
+
     sceUsbdClose(dev_handle);
     if (dev_handle != NULL) {
         OIRB4OpenDevice *opendevice = GetOpenDeviceFromDeviceHandle(dev_handle);
