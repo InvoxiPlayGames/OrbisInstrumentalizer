@@ -23,6 +23,19 @@ struct libusb_device_descriptor {
 	uint8_t bNumConfigurations;
 };
 
+struct libusb_endpoint_descriptor {
+	uint8_t  bLength;
+	uint8_t  bDescriptorType;
+	uint8_t  bEndpointAddress;
+	uint8_t  bmAttributes;
+	uint16_t wMaxPacketSize;
+	uint8_t  bInterval;
+	uint8_t  bRefresh;
+	uint8_t  bSynchAddress;
+	const unsigned char *extra;
+	int extra_length;
+};
+
 struct libusb_interface_descriptor {
 	uint8_t  bLength;
 	uint8_t  bDescriptorType;

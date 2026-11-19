@@ -31,6 +31,22 @@
 #define XINPUT_SUBTYPE_GUITAR_BASS      0x0B
 #define XINPUT_SUBTYPE_ARCADE_PAD       0x13
 
+// wired message types (first byte of a wired report)
+#define XINPUT_MESSAGE_CONTROLS 0x00
+
+// wireless receiver report IDs and types (MS-XUSBI 3.5.5)
+#define XINPUT_WIRELESS_ID_DATA           0x00
+#define XINPUT_WIRELESS_ID_CONNECTION     0x08
+#define XINPUT_WIRELESS_TYPE_CONTROLS     0x01
+#define XINPUT_WIRELESS_TYPE_CONTROLS_PMD 0x03
+#define XINPUT_WIRELESS_TYPE_LINK         0x0F
+#define XINPUT_WIRELESS_LINK_ID           0xCC
+#define XINPUT_WIRELESS_CONNECTED_DATA    0x80
+// controls in a wireless data report start at this offset, using the wired layout
+#define XINPUT_WIRELESS_CONTROLS_OFFSET   4
+// controller subtype in a wireless link report, bit 7 is the force feedback flag
+#define XINPUT_WIRELESS_LINK_SUBTYPE      25
+
 // reports from the controller all start with this header
 typedef struct _xinput_report {
     uint8_t message_type;
