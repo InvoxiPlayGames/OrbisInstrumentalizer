@@ -84,6 +84,12 @@ typedef struct _OIRB4ReceiverSlot {
 #define MAX_PENDING_GAME_TRANSFERS 4
     struct libusb_transfer *pending[MAX_PENDING_GAME_TRANSFERS];
     int pending_count;
+    // reports that came in while the game had no transfer waiting, so short presses (a drum
+    // hit is ~30 ms) aren't lost before it gets around to reading again
+#define MAX_REPORT_BACKLOG 32
+    uint8_t backlog[MAX_REPORT_BACKLOG][PS3_REPORT_SIZE];
+    int backlog_count;
+    uint8_t last_report[PS3_REPORT_SIZE]; // the newest report the game got or will get
     // player LED
     volatile bool led_pending;
     uint8_t led_buffer[XINPUT_OUT_BUFFER_SIZE];
@@ -767,22 +773,69 @@ static uint8_t VelocityFromNegativeAxis(int16_t value) {
 
 // Guitar Hero kits have 3 pads and 2 cymbals, laid out red pad, yellow cymbal, blue pad,
 // orange cymbal, green pad. That goes to Rock Band's 4 lanes as yellow and green cymbals.
+// The kit also has real A/B/X/Y buttons, which press the same bits as the pads but without a
+// velocity. Those have to reach the game as plain face buttons, without the pad/cymbal flags,
+// or Rock Band takes them as drum hits and they don't work in menus.
+// GH velocities are MIDI (1 to 0x7F, higher is harder), PS3 ones go 0x00 (hardest) to 0xFF.
+static uint8_t VelocityFromMidi(uint8_t velocity) {
+    if (velocity > 0x7F)
+        velocity = 0x7F;
+    return (uint8_t)(0xFF - velocity * 2);
+}
+
 static void ConvertFiveLaneDrums(const xinput_report_controls *controls, ps3_instrument_report *report) {
+    uint16_t ly = (uint16_t)controls->left_stick_y;
+    uint16_t rx = (uint16_t)controls->right_stick_x;
+    uint16_t ry = (uint16_t)controls->right_stick_y;
+    uint8_t green_velocity = ly & 0xFF;
+    uint8_t red_velocity = ly >> 8;
+    uint8_t yellow_velocity = rx & 0xFF;
+    uint8_t blue_velocity = rx >> 8;
+    uint8_t orange_velocity = ry & 0xFF;
+
     bool red = (controls->buttons2 & XINPUT_BUTTON_B) != 0;
     bool yellow = (controls->buttons2 & XINPUT_BUTTON_Y) != 0;
     bool blue = (controls->buttons2 & XINPUT_BUTTON_X) != 0;
     bool orange = (controls->buttons2 & XINPUT_BUTTON_RB) != 0;
     bool green = (controls->buttons2 & XINPUT_BUTTON_A) != 0;
-    if (red) report->buttons |= PS3_BUTTON_CIRCLE | PS3_BUTTON_L3;
-    if (blue) report->buttons |= PS3_BUTTON_SQUARE | PS3_BUTTON_L3;
-    if (green) report->buttons |= PS3_BUTTON_CROSS | PS3_BUTTON_L3;
-    if (yellow) {
-        // yellow cymbal: yellow + cymbal flag + d-pad up
-        report->buttons |= PS3_BUTTON_TRIANGLE | PS3_BUTTON_R3;
-        report->hat = 0x00;
+
+    if (red) {
+        report->buttons |= PS3_BUTTON_CIRCLE;
+        if (red_velocity != 0) {
+            report->buttons |= PS3_BUTTON_L3;
+            report->pressure[PS3_DRUM_VELOCITY_RED] = VelocityFromMidi(red_velocity);
+        }
     }
-    if (orange) // green cymbal: green + cymbal flag
+    if (blue) {
+        report->buttons |= PS3_BUTTON_SQUARE;
+        if (blue_velocity != 0) {
+            report->buttons |= PS3_BUTTON_L3;
+            report->pressure[PS3_DRUM_VELOCITY_BLUE] = VelocityFromMidi(blue_velocity);
+        }
+    }
+    if (green) {
+        report->buttons |= PS3_BUTTON_CROSS;
+        if (green_velocity != 0) {
+            report->buttons |= PS3_BUTTON_L3;
+            report->pressure[PS3_DRUM_VELOCITY_GREEN] = VelocityFromMidi(green_velocity);
+        }
+    }
+    if (yellow) {
+        report->buttons |= PS3_BUTTON_TRIANGLE;
+        if (yellow_velocity != 0) {
+            // yellow cymbal: yellow + cymbal flag + d-pad up
+            report->buttons |= PS3_BUTTON_R3;
+            report->hat = 0x00;
+            report->pressure[PS3_DRUM_VELOCITY_YELLOW] = VelocityFromMidi(yellow_velocity);
+        }
+    }
+    if (orange) {
+        // green cymbal: green + cymbal flag. The orange cymbal has no face button.
         report->buttons |= PS3_BUTTON_CROSS | PS3_BUTTON_R3;
+        // a green pad hit at the same time keeps the green byte, the cymbal goes to red's
+        int slot = (green && green_velocity != 0) ? PS3_DRUM_VELOCITY_RED : PS3_DRUM_VELOCITY_GREEN;
+        report->pressure[slot] = VelocityFromMidi(orange_velocity ? orange_velocity : 0x7F);
+    }
     if ((controls->buttons2 & XINPUT_BUTTON_LB) != 0) report->buttons |= PS3_BUTTON_L1; // kick
 }
 
@@ -997,6 +1050,8 @@ static struct {
     struct libusb_transfer *transfer;
     int status;
     int length;
+    bool has_report;
+    uint8_t report[PS3_REPORT_SIZE];
 } deferred_completions[MAX_DEFERRED_COMPLETIONS];
 static int deferred_count = 0;
 
@@ -1020,8 +1075,9 @@ static void LogInputChange(OIRB4OpenDevice *device, const ps3_instrument_report 
         raw->left_stick_x, raw->left_stick_y, raw->right_stick_x, raw->right_stick_y);
 }
 
-// hands a transfer back to the game, with the instrument's current state if it completed
-static void CompleteGameTransfer(struct libusb_transfer *transfer, int status, int length) {
+// hands a transfer back to the game, with the given report (or the instrument's current
+// state) if it completed
+static void CompleteGameTransfer(struct libusb_transfer *transfer, int status, int length, const uint8_t *queued_report) {
     libusb_transfer_cb_fn game_callback = NULL;
     libusb_device_handle *game_handle = NULL;
     if (!LookUpGameTransfer(transfer, &game_callback, &game_handle) || game_callback == NULL) {
@@ -1036,7 +1092,10 @@ static void CompleteGameTransfer(struct libusb_transfer *transfer, int status, i
             transfer->actual_length = length; // OUT: as if it was sent
         } else if (device != NULL) {
             ps3_instrument_report report;
-            BuildPS3Report(device, &report);
+            if (queued_report != NULL)
+                memcpy(&report, queued_report, sizeof(report));
+            else
+                BuildPS3Report(device, &report);
             LogInputChange(device, &report);
             int report_length = transfer->length < PS3_REPORT_SIZE ? transfer->length : PS3_REPORT_SIZE;
             memcpy(transfer->buffer, &report, report_length);
@@ -1047,12 +1106,15 @@ static void CompleteGameTransfer(struct libusb_transfer *transfer, int status, i
     game_callback(transfer);
 }
 
-static void DeferGameTransfer(struct libusb_transfer *transfer, int status, int length) {
+static void DeferGameTransfer(struct libusb_transfer *transfer, int status, int length, const uint8_t *report) {
     LockGameQueue();
     if (deferred_count < MAX_DEFERRED_COMPLETIONS) {
         deferred_completions[deferred_count].transfer = transfer;
         deferred_completions[deferred_count].status = status;
         deferred_completions[deferred_count].length = length;
+        deferred_completions[deferred_count].has_report = report != NULL;
+        if (report != NULL)
+            memcpy(deferred_completions[deferred_count].report, report, PS3_REPORT_SIZE);
         deferred_count++;
     } else {
         OILogLimited(5, "Too many deferred transfer completions\n");
@@ -1061,21 +1123,29 @@ static void DeferGameTransfer(struct libusb_transfer *transfer, int status, int 
 }
 
 static void CompleteDeferredGameTransfers(void) {
-    struct libusb_transfer *transfers[MAX_DEFERRED_COMPLETIONS];
-    int statuses[MAX_DEFERRED_COMPLETIONS];
-    int lengths[MAX_DEFERRED_COMPLETIONS];
+    // only the game's event handling thread gets here, so a static copy is fine
+    static struct {
+        struct libusb_transfer *transfer;
+        int status;
+        int length;
+        bool has_report;
+        uint8_t report[PS3_REPORT_SIZE];
+    } completions[MAX_DEFERRED_COMPLETIONS];
     LockGameQueue();
     int count = deferred_count;
     for (int i = 0; i < count; i++) {
-        transfers[i] = deferred_completions[i].transfer;
-        statuses[i] = deferred_completions[i].status;
-        lengths[i] = deferred_completions[i].length;
+        completions[i].transfer = deferred_completions[i].transfer;
+        completions[i].status = deferred_completions[i].status;
+        completions[i].length = deferred_completions[i].length;
+        completions[i].has_report = deferred_completions[i].has_report;
+        memcpy(completions[i].report, deferred_completions[i].report, PS3_REPORT_SIZE);
     }
     deferred_count = 0;
     UnlockGameQueue();
     // outside the lock, the game will usually resubmit from its callback
     for (int i = 0; i < count; i++)
-        CompleteGameTransfer(transfers[i], statuses[i], lengths[i]);
+        CompleteGameTransfer(completions[i].transfer, completions[i].status, completions[i].length,
+            completions[i].has_report ? completions[i].report : NULL);
 }
 
 static bool RemovePendingGameTransfer(OIRB4ReceiverSlot *slot, struct libusb_transfer *transfer) {
@@ -1103,7 +1173,7 @@ static void FailPendingGameTransfers(OIRB4ReceiverSlot *slot, int status) {
     slot->pending_count = 0;
     UnlockGameQueue();
     for (int i = 0; i < count; i++)
-        DeferGameTransfer(transfers[i], status, 0);
+        DeferGameTransfer(transfers[i], status, 0, NULL);
 }
 
 // a packet from a slot, read by our own reader
@@ -1117,18 +1187,38 @@ static void SlotPacketArrived(OIRB4ReceiverSlot *slot, const uint8_t *data, int 
     OILogLimited(10, "Read from slot %d: %d bytes, starting %02X %02X\n",
         slot->index + 1, length, length > 0 ? data[0] : 0, length > 1 ? data[1] : 0);
 
-    // answer the game's oldest waiting transfer with the new state
+    ps3_instrument_report report;
+    BuildPS3Report(device, &report);
+
+    // answer the game's oldest waiting transfer with the new state, or keep it for when the
+    // game reads again if it isn't waiting right now and something changed
     struct libusb_transfer *transfer = NULL;
     LockGameQueue();
-    if (slot->pending_count > 0 && !slot->unplugging) {
+    if (slot->unplugging) {
+        UnlockGameQueue();
+        return;
+    }
+    if (slot->pending_count > 0 && slot->backlog_count == 0) {
         transfer = slot->pending[0];
         for (int i = 0; i < slot->pending_count - 1; i++)
             slot->pending[i] = slot->pending[i + 1];
         slot->pending_count--;
+        memcpy(slot->last_report, &report, PS3_REPORT_SIZE);
+    } else {
+        const uint8_t *previous = slot->backlog_count > 0 ? slot->backlog[slot->backlog_count - 1] : slot->last_report;
+        if (memcmp(previous, &report, PS3_REPORT_SIZE) != 0) {
+            if (slot->backlog_count == MAX_REPORT_BACKLOG) {
+                // the game stopped reading: keep the newest ones
+                memmove(slot->backlog[0], slot->backlog[1], (MAX_REPORT_BACKLOG - 1) * PS3_REPORT_SIZE);
+                slot->backlog_count--;
+            }
+            memcpy(slot->backlog[slot->backlog_count++], &report, PS3_REPORT_SIZE);
+            memcpy(slot->last_report, &report, PS3_REPORT_SIZE);
+        }
     }
     UnlockGameQueue();
     if (transfer != NULL)
-        CompleteGameTransfer(transfer, LIBUSB_TRANSFER_COMPLETED, 0);
+        CompleteGameTransfer(transfer, LIBUSB_TRANSFER_COMPLETED, 0, (const uint8_t *)&report);
 }
 
 // the slot a transfer the game set up belongs to, NULL if it's not for a receiver slot
@@ -1559,17 +1649,28 @@ int TsceUsbdSubmitTransfer_hook(struct libusb_transfer *transfer) {
         transfer->dev_handle = slot->receiver->handle;
         if ((transfer->endpoint & 0x80) == 0) {
             // nothing to send a PS3 output report to, so it's done right away
-            DeferGameTransfer(transfer, LIBUSB_TRANSFER_COMPLETED, transfer->length);
+            DeferGameTransfer(transfer, LIBUSB_TRANSFER_COMPLETED, transfer->length, NULL);
             OILogLimited(10, "Game OUT transfer to slot %d answered\n", slot->index + 1);
             return 0;
         }
         bool queued = false;
+        bool from_backlog = false;
+        uint8_t report[PS3_REPORT_SIZE];
         LockGameQueue();
-        if (slot->pending_count < MAX_PENDING_GAME_TRANSFERS) {
+        if (slot->backlog_count > 0) {
+            // something happened since the game last read: hand it the oldest change
+            memcpy(report, slot->backlog[0], PS3_REPORT_SIZE);
+            memmove(slot->backlog[0], slot->backlog[1], (slot->backlog_count - 1) * PS3_REPORT_SIZE);
+            slot->backlog_count--;
+            from_backlog = true;
+            queued = true;
+        } else if (slot->pending_count < MAX_PENDING_GAME_TRANSFERS) {
             slot->pending[slot->pending_count++] = transfer;
             queued = true;
         }
         UnlockGameQueue();
+        if (from_backlog)
+            DeferGameTransfer(transfer, LIBUSB_TRANSFER_COMPLETED, 0, report);
         StartWatching(slot);
         OILogLimited(10, "Game transfer queued on slot %d (%s)\n", slot->index + 1, queued ? "ok" : "queue full");
         return queued ? 0 : SCE_USBD_ERROR_REQUEST_FAILED;
@@ -1585,7 +1686,7 @@ int TsceUsbdCancelTransfer_hook(struct libusb_transfer *transfer) {
     if (slot != NULL) {
         // the cancellation comes back to the game on its next event handling, like a real one
         if (RemovePendingGameTransfer(slot, transfer))
-            DeferGameTransfer(transfer, LIBUSB_TRANSFER_CANCELLED, 0);
+            DeferGameTransfer(transfer, LIBUSB_TRANSFER_CANCELLED, 0, NULL);
         OILogLimited(20, "Game cancelled a transfer on slot %d\n", slot->index + 1);
         return 0;
     }
