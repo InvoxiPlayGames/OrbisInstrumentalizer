@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <GoldHEN/Common.h>
 #include <orbis/Sysmodule.h>
@@ -25,6 +26,8 @@
 #include "OrbisUsbd.h"
 #include "xinput.h"
 #include "oi_log.h"
+#include "oi_config.h"
+#include "stub_finder.h"
 
 #define final_printf OILog
 
@@ -88,6 +91,7 @@ typedef struct _OIRB4ReceiverSlot {
     // hit is ~30 ms) aren't lost before it gets around to reading again
 #define MAX_REPORT_BACKLOG 32
     uint8_t backlog[MAX_REPORT_BACKLOG][PS3_REPORT_SIZE];
+    uint64_t backlog_time[MAX_REPORT_BACKLOG]; // when each one came in, in microseconds
     int backlog_count;
     uint8_t last_report[PS3_REPORT_SIZE]; // the newest report the game got or will get
     // player LED
@@ -107,6 +111,47 @@ struct _OIRB4Receiver {
 };
 
 static OIRB4Receiver receivers[MAX_RECEIVERS] = { 0 };
+
+/* ------------------------------------------------------------------------------------------
+    Latency statistics
+------------------------------------------------------------------------------------------ */
+
+// Input reaches the game one of two ways: straight away, when the game already had a read
+// waiting as the packet came in, or from the backlog, when the game reads again later. The
+// second kind waits in the backlog, then until the game's next event handling call.
+static struct {
+    int immediate;
+    int from_backlog;
+    uint64_t backlog_wait_sum, backlog_wait_max;
+    int deferred;
+    uint64_t deferred_wait_sum, deferred_wait_max;
+    int event_calls;
+    uint64_t event_gap_max, last_event_call;
+    uint64_t last_log;
+} latency;
+
+static uint64_t NowMicros(void) {
+    return sceKernelGetProcessTime();
+}
+
+static void LogLatency(uint64_t now) {
+    if (!oi_config.latency_log || now - latency.last_log < 10000000)
+        return;
+    if (latency.immediate + latency.from_backlog > 0) {
+        OILog("Latency: %d inputs on time, %d from backlog (wait avg %lu us, max %lu us), "
+            "release wait avg %lu us, max %lu us; game USB polls %d in 10 s, longest gap %lu us\n",
+            latency.immediate, latency.from_backlog,
+            (unsigned long)(latency.from_backlog ? latency.backlog_wait_sum / latency.from_backlog : 0),
+            (unsigned long)latency.backlog_wait_max,
+            (unsigned long)(latency.deferred ? latency.deferred_wait_sum / latency.deferred : 0),
+            (unsigned long)latency.deferred_wait_max,
+            latency.event_calls, (unsigned long)latency.event_gap_max);
+    }
+    uint64_t last_event_call = latency.last_event_call;
+    memset(&latency, 0, sizeof(latency));
+    latency.last_log = now;
+    latency.last_event_call = last_event_call;
+}
 
 // defined further down, once open devices and reports are
 static void SlotPacketArrived(OIRB4ReceiverSlot *slot, const uint8_t *data, int length);
@@ -186,6 +231,18 @@ typedef struct _OIRB4OpenDevice {
     // for logging input changes
     uint16_t logged_buttons;
     uint8_t logged_hat;
+    // tilt, with a little hysteresis and a hold time so strumming hard doesn't set it off
+    bool tilted;
+    uint64_t tilt_since; // when the tilt crossed the threshold, 0 if it isn't past it
+    // raw ranges seen since the last calibration log line
+    struct {
+        bool dirty;
+        int tilt_min, tilt_max;
+        int whammy_min, whammy_max;
+        int velocity_min[6], velocity_max[6], hits[6];
+        uint8_t previous_buttons2;
+        uint64_t last_log;
+    } calibration;
 } OIRB4OpenDevice;
 
 #define MAX_DEVICE_COUNT 8
@@ -628,6 +685,113 @@ static void DetectFiveLaneDrums(OIRB4OpenDevice *device) {
     }
 }
 
+static void ResetCalibration(OIRB4OpenDevice *device) {
+    device->calibration.dirty = false;
+    device->calibration.tilt_min = 0x7FFFFFFF;
+    device->calibration.tilt_max = -0x7FFFFFFF;
+    device->calibration.whammy_min = 0x7FFFFFFF;
+    device->calibration.whammy_max = -0x7FFFFFFF;
+    for (int i = 0; i < 6; i++) {
+        device->calibration.velocity_min[i] = 0x7FFFFFFF;
+        device->calibration.velocity_max[i] = 0;
+        device->calibration.hits[i] = 0;
+    }
+}
+
+static int DeviceNumber(const OIRB4OpenDevice *device) {
+    return device->slot != NULL ? device->slot->index + 1 : 0;
+}
+
+// keeps the raw ranges for the calibration log, and writes it every 5 seconds
+static void TrackCalibration(OIRB4OpenDevice *device) {
+    if (!oi_config.calibration_log)
+        return;
+    const xinput_report_controls *controls = (const xinput_report_controls *)device->last_controls;
+    if (device->calibration.last_log == 0) {
+        ResetCalibration(device);
+        device->calibration.last_log = NowMicros();
+    }
+    if (device->kind == RB4_Kind_Guitar) {
+        int tilt = controls->right_stick_y;
+        int whammy = ((int32_t)controls->right_stick_x + 32768) >> 8;
+        if (tilt < device->calibration.tilt_min) device->calibration.tilt_min = tilt;
+        if (tilt > device->calibration.tilt_max) device->calibration.tilt_max = tilt;
+        if (whammy < device->calibration.whammy_min) device->calibration.whammy_min = whammy;
+        if (whammy > device->calibration.whammy_max) device->calibration.whammy_max = whammy;
+        device->calibration.dirty = true;
+    } else if (device->five_lane) {
+        // green, red, yellow, blue, orange, kick: same order as the report's velocity bytes
+        static const uint8_t buttons[6] = { XINPUT_BUTTON_A, XINPUT_BUTTON_B, XINPUT_BUTTON_Y,
+            XINPUT_BUTTON_X, XINPUT_BUTTON_RB, XINPUT_BUTTON_LB };
+        uint16_t ly = (uint16_t)controls->left_stick_y;
+        uint16_t rx = (uint16_t)controls->right_stick_x;
+        uint16_t ry = (uint16_t)controls->right_stick_y;
+        int velocities[6] = { ly & 0xFF, ly >> 8, rx & 0xFF, rx >> 8, ry & 0xFF, ry >> 8 };
+        uint8_t pressed = controls->buttons2 & ~device->calibration.previous_buttons2;
+        for (int i = 0; i < 6; i++) {
+            if ((pressed & buttons[i]) == 0 || velocities[i] == 0)
+                continue;
+            device->calibration.hits[i]++;
+            if (velocities[i] < device->calibration.velocity_min[i]) device->calibration.velocity_min[i] = velocities[i];
+            if (velocities[i] > device->calibration.velocity_max[i]) device->calibration.velocity_max[i] = velocities[i];
+            device->calibration.dirty = true;
+        }
+        device->calibration.previous_buttons2 = controls->buttons2;
+    }
+
+    uint64_t now = NowMicros();
+    if (now - device->calibration.last_log < 5000000)
+        return;
+    device->calibration.last_log = now;
+    if (!device->calibration.dirty)
+        return;
+    if (device->kind == RB4_Kind_Guitar) {
+        OILog("Calibration %d (guitar): tilt %d..%d (tilted above %d), whammy %d..%d (released below %d)\n",
+            DeviceNumber(device), device->calibration.tilt_min, device->calibration.tilt_max,
+            device->subtype == XINPUT_SUBTYPE_GUITAR_ALTERNATE ? oi_config.gh_tilt_threshold : oi_config.rb_tilt_threshold,
+            device->calibration.whammy_min, device->calibration.whammy_max, oi_config.whammy_deadzone);
+    } else {
+        static const char *names[6] = { "green", "red", "yellow", "blue", "orange", "kick" };
+        char line[320];
+        int at = 0;
+        for (int i = 0; i < 6 && at < (int)sizeof(line); i++) {
+            if (device->calibration.hits[i] == 0)
+                continue;
+            at += snprintf(line + at, sizeof(line) - at, " %s %dx %d..%d;", names[i], device->calibration.hits[i],
+                device->calibration.velocity_min[i], device->calibration.velocity_max[i]);
+        }
+        line[at < (int)sizeof(line) ? at : (int)sizeof(line) - 1] = '\0';
+        OILog("Calibration %d (drums, hits softer than %d ignored):%s\n", DeviceNumber(device),
+            oi_config.drum_min_velocity, line);
+    }
+    ResetCalibration(device);
+}
+
+// Tilted once the tilt stays past the threshold for tilt_hold_ms, untilted once it drops a
+// margin below it. Hard strums shake the accelerometer past the threshold for a packet or two.
+#define TILT_RELEASE_MARGIN 3000
+static void UpdateTilt(OIRB4OpenDevice *device) {
+    if (device->kind != RB4_Kind_Guitar)
+        return;
+    const xinput_report_controls *controls = (const xinput_report_controls *)device->last_controls;
+    int threshold = device->subtype == XINPUT_SUBTYPE_GUITAR_ALTERNATE ? oi_config.gh_tilt_threshold : oi_config.rb_tilt_threshold;
+    int tilt = controls->right_stick_y;
+    uint64_t now = NowMicros();
+    if (!device->tilted) {
+        if (tilt <= threshold) {
+            device->tilt_since = 0;
+        } else {
+            if (device->tilt_since == 0)
+                device->tilt_since = now;
+            if (now - device->tilt_since >= (uint64_t)oi_config.tilt_hold_ms * 1000)
+                device->tilted = true;
+        }
+    } else if (tilt < threshold - TILT_RELEASE_MARGIN) {
+        device->tilted = false;
+        device->tilt_since = 0;
+    }
+}
+
 static void HandleWirelessPacket(OIRB4OpenDevice *device, const uint8_t *data, int length) {
     if (length < 2)
         return;
@@ -647,6 +811,8 @@ static void HandleWirelessPacket(OIRB4OpenDevice *device, const uint8_t *data, i
             memcpy(device->last_controls, data + XINPUT_WIRELESS_CONTROLS_OFFSET, XINPUT_CONTROLS_SIZE);
             device->has_input = true;
             DetectFiveLaneDrums(device);
+            UpdateTilt(device);
+            TrackCalibration(device);
         }
     } else if (data[1] == XINPUT_WIRELESS_TYPE_LINK) {
         HandleSlotLinkPacket(device->slot, data, length);
@@ -660,6 +826,8 @@ static void HandleWiredPacket(OIRB4OpenDevice *device, const uint8_t *data, int 
         memcpy(device->last_controls, data, XINPUT_CONTROLS_SIZE);
         device->has_input = true;
         DetectFiveLaneDrums(device);
+        UpdateTilt(device);
+        TrackCalibration(device);
     }
 }
 
@@ -736,10 +904,8 @@ _Static_assert(sizeof(ps3_instrument_report) == PS3_REPORT_SIZE, "PS3 report mus
 #define PS3_DRUM_VELOCITY_GREEN  6
 #define PS3_DRUM_VELOCITY_BLUE   7
 
-// the tilt sensor reads as an axis on 360 guitars, but a button on PS3 guitars
-#define GUITAR_TILT_THRESHOLD 0x4000
-#define GH_TILT_THRESHOLD 27000
-#define GH_WHAMMY_DEADZONE 0x30
+// the tilt sensor reads as an axis on 360 guitars, but a button on PS3 guitars; the
+// thresholds and the whammy deadzone come from the settings file (oi_config)
 
 static uint8_t HatFromDpad(uint8_t buttons1) {
     bool up = (buttons1 & XINPUT_BUTTON_UP) != 0;
@@ -798,6 +964,14 @@ static void ConvertFiveLaneDrums(const xinput_report_controls *controls, ps3_ins
     bool blue = (controls->buttons2 & XINPUT_BUTTON_X) != 0;
     bool orange = (controls->buttons2 & XINPUT_BUTTON_RB) != 0;
     bool green = (controls->buttons2 & XINPUT_BUTTON_A) != 0;
+
+    // hits softer than the minimum are dropped (face buttons have no velocity and stay)
+    int minimum = oi_config.drum_min_velocity;
+    if (red_velocity != 0 && red_velocity < minimum) red = false;
+    if (blue_velocity != 0 && blue_velocity < minimum) blue = false;
+    if (green_velocity != 0 && green_velocity < minimum) green = false;
+    if (yellow_velocity != 0 && yellow_velocity < minimum) yellow = false;
+    if (orange_velocity != 0 && orange_velocity < minimum) orange = false;
 
     if (red) {
         report->buttons |= PS3_BUTTON_CIRCLE;
@@ -858,7 +1032,7 @@ static void ConvertDrums(const xinput_report_controls *controls, ps3_instrument_
     report->pressure[PS3_DRUM_VELOCITY_GREEN] = VelocityFromNegativeAxis(controls->right_stick_y);
 }
 
-static void ConvertGuitar(const xinput_report_controls *controls, uint8_t subtype, ps3_instrument_report *report) {
+static void ConvertGuitar(const xinput_report_controls *controls, uint8_t subtype, bool tilted, ps3_instrument_report *report) {
     // frets
     if ((controls->buttons2 & XINPUT_BUTTON_A) != 0) report->buttons |= PS3_BUTTON_CROSS; // green
     if ((controls->buttons2 & XINPUT_BUTTON_B) != 0) report->buttons |= PS3_BUTTON_CIRCLE; // red
@@ -868,13 +1042,15 @@ static void ConvertGuitar(const xinput_report_controls *controls, uint8_t subtyp
     bool guitar_hero = subtype == XINPUT_SUBTYPE_GUITAR_ALTERNATE;
     // whammy goes from -32768 (released) to 32767 on 360, 0x00 to 0xFF on PS3
     uint8_t whammy = (uint8_t)(((int32_t)controls->right_stick_x + 32768) >> 8);
-    // Guitar Hero whammy bars wobble a bit at rest
-    if (guitar_hero && whammy < GH_WHAMMY_DEADZONE)
-        whammy = 0;
+    // Guitar Hero whammy bars wobble a bit at rest: cut that off, and stretch what's left so
+    // the bar still goes all the way
+    int deadzone = oi_config.whammy_deadzone;
+    if (guitar_hero && deadzone > 0 && deadzone < 255)
+        whammy = whammy < deadzone ? 0 : (uint8_t)((whammy - deadzone) * 255 / (255 - deadzone));
     report->right_stick_x = whammy;
-    // tilt: a switch on Rock Band guitars, an accelerometer on Guitar Hero ones, which reads up
-    // to about 20000 when held normally and close to 32767 when pointed up
-    if (controls->right_stick_y > (guitar_hero ? GH_TILT_THRESHOLD : GUITAR_TILT_THRESHOLD))
+    // tilt: a switch on Rock Band guitars, an accelerometer on Guitar Hero ones, which reads
+    // about 12000 to 24000 while playing and 32767 when pointed up (see UpdateTilt)
+    if (tilted)
         report->buttons |= PS3_BUTTON_R1;
     // Guitar Hero guitars use these for an accelerometer and the touch bar instead
     if (subtype != XINPUT_SUBTYPE_GUITAR_ALTERNATE) {
@@ -905,7 +1081,7 @@ static void BuildPS3Report(const OIRB4OpenDevice *device, ps3_instrument_report 
     else if (device->kind == RB4_Kind_Drums)
         ConvertDrums(controls, report);
     else
-        ConvertGuitar(controls, device->subtype, report);
+        ConvertGuitar(controls, device->subtype, device->tilted, report);
 }
 
 /* ------------------------------------------------------------------------------------------
@@ -1052,6 +1228,7 @@ static struct {
     int length;
     bool has_report;
     uint8_t report[PS3_REPORT_SIZE];
+    uint64_t queued_at;
 } deferred_completions[MAX_DEFERRED_COMPLETIONS];
 static int deferred_count = 0;
 
@@ -1115,6 +1292,7 @@ static void DeferGameTransfer(struct libusb_transfer *transfer, int status, int 
         deferred_completions[deferred_count].has_report = report != NULL;
         if (report != NULL)
             memcpy(deferred_completions[deferred_count].report, report, PS3_REPORT_SIZE);
+        deferred_completions[deferred_count].queued_at = NowMicros();
         deferred_count++;
     } else {
         OILogLimited(5, "Too many deferred transfer completions\n");
@@ -1131,9 +1309,16 @@ static void CompleteDeferredGameTransfers(void) {
         bool has_report;
         uint8_t report[PS3_REPORT_SIZE];
     } completions[MAX_DEFERRED_COMPLETIONS];
+    uint64_t now = NowMicros();
     LockGameQueue();
     int count = deferred_count;
     for (int i = 0; i < count; i++) {
+        if (deferred_completions[i].has_report) {
+            uint64_t wait = now - deferred_completions[i].queued_at;
+            latency.deferred++;
+            latency.deferred_wait_sum += wait;
+            if (wait > latency.deferred_wait_max) latency.deferred_wait_max = wait;
+        }
         completions[i].transfer = deferred_completions[i].transfer;
         completions[i].status = deferred_completions[i].status;
         completions[i].length = deferred_completions[i].length;
@@ -1204,14 +1389,17 @@ static void SlotPacketArrived(OIRB4ReceiverSlot *slot, const uint8_t *data, int 
             slot->pending[i] = slot->pending[i + 1];
         slot->pending_count--;
         memcpy(slot->last_report, &report, PS3_REPORT_SIZE);
+        latency.immediate++;
     } else {
         const uint8_t *previous = slot->backlog_count > 0 ? slot->backlog[slot->backlog_count - 1] : slot->last_report;
         if (memcmp(previous, &report, PS3_REPORT_SIZE) != 0) {
             if (slot->backlog_count == MAX_REPORT_BACKLOG) {
                 // the game stopped reading: keep the newest ones
                 memmove(slot->backlog[0], slot->backlog[1], (MAX_REPORT_BACKLOG - 1) * PS3_REPORT_SIZE);
+                memmove(slot->backlog_time, slot->backlog_time + 1, (MAX_REPORT_BACKLOG - 1) * sizeof(uint64_t));
                 slot->backlog_count--;
             }
+            slot->backlog_time[slot->backlog_count] = NowMicros();
             memcpy(slot->backlog[slot->backlog_count++], &report, PS3_REPORT_SIZE);
             memcpy(slot->last_report, &report, PS3_REPORT_SIZE);
         }
@@ -1660,7 +1848,12 @@ int TsceUsbdSubmitTransfer_hook(struct libusb_transfer *transfer) {
         if (slot->backlog_count > 0) {
             // something happened since the game last read: hand it the oldest change
             memcpy(report, slot->backlog[0], PS3_REPORT_SIZE);
+            uint64_t wait = NowMicros() - slot->backlog_time[0];
+            latency.from_backlog++;
+            latency.backlog_wait_sum += wait;
+            if (wait > latency.backlog_wait_max) latency.backlog_wait_max = wait;
             memmove(slot->backlog[0], slot->backlog[1], (slot->backlog_count - 1) * PS3_REPORT_SIZE);
+            memmove(slot->backlog_time, slot->backlog_time + 1, (slot->backlog_count - 1) * sizeof(uint64_t));
             slot->backlog_count--;
             from_backlog = true;
             queued = true;
@@ -1698,6 +1891,13 @@ int TsceUsbdCancelTransfer_hook(struct libusb_transfer *transfer) {
 
 // the game handles USB events regularly, which is when completions that were held back go out
 int TsceUsbdHandleEventsTimeout_hook(uint64_t a, uint64_t b, uint64_t c) {
+    uint64_t now = NowMicros();
+    if (latency.last_event_call != 0 && now - latency.last_event_call > latency.event_gap_max)
+        latency.event_gap_max = now - latency.last_event_call;
+    latency.last_event_call = now;
+    latency.event_calls++;
+    OILogLimited(3, "Game handles USB events: args 0x%lx 0x%lx 0x%lx\n", (unsigned long)a, (unsigned long)b, (unsigned long)c);
+    LogLatency(now);
     int r = ((int (*)(uint64_t, uint64_t, uint64_t))sceUsbdHandleEventsTimeout)(a, b, c);
     CompleteDeferredGameTransfers();
     return r;
@@ -1706,37 +1906,97 @@ int TsceUsbdHandleEventsTimeout_hook(uint64_t a, uint64_t b, uint64_t c) {
 #define ADDR_OFFSET 0x00400000
 void InitUsbdHooks() {
     OILogOpen();
+    OIConfigLoad();
     // make sure we have the USBD module loaded into memory
     sceSysmoduleLoadModule(ORBIS_SYSMODULE_USBD);
     struct proc_info procInfo;
     sys_sdk_proc_info(&procInfo);
     final_printf("Rock Band 4 %s, applying sceUsbd hooks\n", procInfo.version);
 
-    if (strcmp(procInfo.version, "02.21") != 0) {
-        final_printf("This plugin is only compatible with version 02.21 of Rock Band 4.\n");
-        return;
+    // the game's PLT stubs for its sceUsbd imports (see stub_finder.c), all 21 of them sorted
+    // by name, since the layout check needs the full list
+    static const char *const names[] = {
+        "sceUsbdAllocTransfer", "sceUsbdCancelTransfer", "sceUsbdCheckConnected", "sceUsbdClose",
+        "sceUsbdControlTransfer", "sceUsbdExit", "sceUsbdFillInterruptTransfer",
+        "sceUsbdFreeConfigDescriptor", "sceUsbdFreeDeviceList", "sceUsbdFreeTransfer",
+        "sceUsbdGetBusNumber", "sceUsbdGetConfigDescriptor", "sceUsbdGetDescriptor",
+        "sceUsbdGetDeviceAddress", "sceUsbdGetDeviceDescriptor", "sceUsbdGetDeviceList",
+        "sceUsbdGetStringDescriptorAscii", "sceUsbdHandleEventsTimeout", "sceUsbdInit", "sceUsbdOpen",
+        "sceUsbdSubmitTransfer",
+    };
+    enum { AllocTransfer, CancelTransfer, CheckConnected, Close, ControlTransfer, Exit,
+        FillInterruptTransfer, FreeConfigDescriptor, FreeDeviceList, FreeTransfer, GetBusNumber,
+        GetConfigDescriptor, GetDescriptor, GetDeviceAddress, GetDeviceDescriptor, GetDeviceList,
+        GetStringDescriptorAscii, HandleEventsTimeout, Init, Open, SubmitTransfer, ImportCount };
+    // where they are in version 02.21 (tools/ps4_imports.py), to check the finder against
+    static const uint64_t known_0221[ImportCount] = {
+        0x1245130, 0x1245140, 0x1245150, 0x1245160, 0x1245170, 0x1245180, 0x1245190, 0x12451a0,
+        0x12451b0, 0x12451c0, 0x12451d0, 0x12451e0, 0x12451f0, 0x1245200, 0x1245210, 0x1245220,
+        0x1245230, 0x1245240, 0x1245250, 0x1245260, 0x1245270,
+    };
+    uint64_t stubs[ImportCount], gots[ImportCount];
+    // the library's addresses, from our own imports of the same functions
+    uint64_t targets[ImportCount] = { 0 };
+    targets[AllocTransfer] = ResolveOwnImport((const void *)sceUsbdAllocTransfer);
+    targets[CancelTransfer] = ResolveOwnImport((const void *)sceUsbdCancelTransfer);
+    targets[CheckConnected] = ResolveOwnImport((const void *)sceUsbdCheckConnected);
+    targets[Close] = ResolveOwnImport((const void *)sceUsbdClose);
+    targets[ControlTransfer] = ResolveOwnImport((const void *)sceUsbdControlTransfer);
+    targets[FillInterruptTransfer] = ResolveOwnImport((const void *)sceUsbdFillInterruptTransfer);
+    targets[FreeConfigDescriptor] = ResolveOwnImport((const void *)sceUsbdFreeConfigDescriptor);
+    targets[FreeTransfer] = ResolveOwnImport((const void *)sceUsbdFreeTransfer);
+    targets[GetBusNumber] = ResolveOwnImport((const void *)sceUsbdGetBusNumber);
+    targets[GetConfigDescriptor] = ResolveOwnImport((const void *)sceUsbdGetConfigDescriptor);
+    targets[GetDeviceAddress] = ResolveOwnImport((const void *)sceUsbdGetDeviceAddress);
+    targets[GetDeviceDescriptor] = ResolveOwnImport((const void *)sceUsbdGetDeviceDescriptor);
+    targets[GetDeviceList] = ResolveOwnImport((const void *)sceUsbdGetDeviceList);
+    targets[Open] = ResolveOwnImport((const void *)sceUsbdOpen);
+    targets[SubmitTransfer] = ResolveOwnImport((const void *)sceUsbdSubmitTransfer);
+    int resolved = 0;
+    for (int i = 0; i < ImportCount; i++)
+        resolved += targets[i] != 0;
+    final_printf("Resolved %d sceUsbd functions from our own imports\n", resolved);
+    int found = FindImportStubs("libSceUsbd", names, ImportCount, procInfo.base_address, targets, stubs, gots);
+    bool is_0221 = strcmp(procInfo.version, "02.21") == 0;
+    int matching = 0;
+    for (int i = 0; i < ImportCount; i++) {
+        if (stubs[i] != 0 && stubs[i] - procInfo.base_address == known_0221[i])
+            matching++;
+    }
+    final_printf("Found %d of %d sceUsbd stubs, %d where 02.21 has them\n", found, ImportCount, matching);
+    if (found != ImportCount) {
+        if (!is_0221) {
+            final_printf("Couldn't find the game's USB functions in version %s\n", procInfo.version);
+            DoNotification("RB4 Instruments: versao do jogo nao suportada");
+            return;
+        }
+        // fall back on the known addresses
+        final_printf("Using the known 02.21 addresses\n");
+        for (int i = 0; i < ImportCount; i++)
+            stubs[i] = procInfo.base_address + known_0221[i];
+    } else if (is_0221 && matching != ImportCount) {
+        // the finder disagrees with what we know is right: don't trust it
+        final_printf("Finder disagrees with the known 02.21 addresses, using those\n");
+        for (int i = 0; i < ImportCount; i++)
+            stubs[i] = procInfo.base_address + known_0221[i];
     }
 
-    // TODO: Figure out why we can't just hook sceUsbd directly
-    // right now this is pretty bad form, to hook the game's own stubs
-    // less game-agnostic (not that any other games use Usbd) and less version-agnostic
-    // (these are the game's PLT stubs for each import, see tools/ps4_imports.py)
-    TsceUsbdCancelTransfer = (void*)(procInfo.base_address + 0x01245140);
-    TsceUsbdCheckConnected = (void*)(procInfo.base_address + 0x01245150);
-    TsceUsbdClose = (void*)(procInfo.base_address + 0x01245160);
-    TsceUsbdControlTransfer = (void*)(procInfo.base_address + 0x01245170);
-    TsceUsbdFillInterruptTransfer = (void*)(procInfo.base_address + 0x01245190);
-    TsceUsbdFreeDeviceList = (void*)(procInfo.base_address + 0x012451b0);
-    TsceUsbdGetBusNumber = (void*)(procInfo.base_address + 0x012451d0);
-    TsceUsbdGetConfigDescriptor = (void*)(procInfo.base_address + 0x012451e0);
-    TsceUsbdGetDescriptor = (void*)(procInfo.base_address + 0x012451f0);
-    TsceUsbdGetDeviceAddress = (void*)(procInfo.base_address + 0x01245200);
-    TsceUsbdGetDeviceDescriptor = (void*)(procInfo.base_address + 0x01245210);
-    TsceUsbdGetDeviceList = (void*)(procInfo.base_address + 0x01245220);
-    TsceUsbdGetStringDescriptorAscii = (void*)(procInfo.base_address + 0x01245230);
-    TsceUsbdHandleEventsTimeout = (void*)(procInfo.base_address + 0x01245240);
-    TsceUsbdOpen = (void*)(procInfo.base_address + 0x01245260);
-    TsceUsbdSubmitTransfer = (void*)(procInfo.base_address + 0x01245270);
+    TsceUsbdCancelTransfer = (void*)stubs[CancelTransfer];
+    TsceUsbdCheckConnected = (void*)stubs[CheckConnected];
+    TsceUsbdClose = (void*)stubs[Close];
+    TsceUsbdControlTransfer = (void*)stubs[ControlTransfer];
+    TsceUsbdFillInterruptTransfer = (void*)stubs[FillInterruptTransfer];
+    TsceUsbdFreeDeviceList = (void*)stubs[FreeDeviceList];
+    TsceUsbdGetBusNumber = (void*)stubs[GetBusNumber];
+    TsceUsbdGetConfigDescriptor = (void*)stubs[GetConfigDescriptor];
+    TsceUsbdGetDescriptor = (void*)stubs[GetDescriptor];
+    TsceUsbdGetDeviceAddress = (void*)stubs[GetDeviceAddress];
+    TsceUsbdGetDeviceDescriptor = (void*)stubs[GetDeviceDescriptor];
+    TsceUsbdGetDeviceList = (void*)stubs[GetDeviceList];
+    TsceUsbdGetStringDescriptorAscii = (void*)stubs[GetStringDescriptorAscii];
+    TsceUsbdHandleEventsTimeout = (void*)stubs[HandleEventsTimeout];
+    TsceUsbdOpen = (void*)stubs[Open];
+    TsceUsbdSubmitTransfer = (void*)stubs[SubmitTransfer];
 
     // apply all the hooks to the usbd library
     HOOK(TsceUsbdCancelTransfer);
