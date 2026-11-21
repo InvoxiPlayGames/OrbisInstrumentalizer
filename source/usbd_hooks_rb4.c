@@ -1967,7 +1967,7 @@ void InitUsbdHooks() {
     if (found != ImportCount) {
         if (!is_0221) {
             final_printf("Couldn't find the game's USB functions in version %s\n", procInfo.version);
-            DoNotification("RB4 Instruments: versao do jogo nao suportada");
+            DoNotification("OrbisInstrumentalizer: this Rock Band 4 version isn't supported");
             return;
         }
         // fall back on the known addresses
